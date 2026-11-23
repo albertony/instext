@@ -1,0 +1,5 @@
+bin/
+build/
+.claude/
+.vscode/
+tests/samples/

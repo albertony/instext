@@ -1,0 +1,400 @@
+# Builds InstExt and runs its tests for every push to main, for every pull request and three times
+# a month: on Windows the way the README describes, and on Linux with the sanitizers of GCC. The
+# Linux job also reads the sources with Cppcheck and Clang-Tidy. For a tag that starts with "v",
+# and when a run started by hand asks for it, another job drafts a release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  # On the 6th, 16th and 26th (about every 10 days) at 04:19 UTC (random to avoid GitHub busy times),
+  # to see whether the code still builds and passes with the runner images of the day, which GitHub
+  # replaces about weekly.
+  schedule:
+    - cron: '19 4 6,16,26 * *'
+  # A run started by hand can leave out either of the first two jobs, and runs CodeQL or drafts a
+  # release only if asked.
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: Run Windows Build
+        type: boolean
+        default: true
+      linux:
+        description: Run Linux Analysis
+        type: boolean
+        default: true
+      codeql:
+        description: Run CodeQL
+        type: boolean
+        default: false
+      release:
+        description: Run Draft Release (needs the windows and linux jobs, and must run on main or a version tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer run for the same branch or pull request takes the place of one that is still going.
+# Runs started by hand and runs started by a push are kept apart: neither replaces the other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # Build and test on Windows.
+  # Building in release configuration and uploading resulting binaries as artifact that can be
+  # picked up by the release job.
+  windows:
+    name: Windows Build
+    if: github.event_name != 'workflow_dispatch' || inputs.windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      about: ${{ steps.version.outputs.about }}
+    env:
+      # Where vcpkg keeps the libraries it has built. The job carries the folder over to later runs.
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+      # No usage data from PowerShell or from the developer shell of Visual Studio.
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+      VSCMD_SKIP_SENDTELEMETRY: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      # The key for the cached libraries is made of the runner's image, as in win25-vs2026 and
+      # 20261116.315.1, and of vcpkg.json. It is not there to keep out libraries that no longer
+      # fit, which vcpkg does itself, but because a saved entry cannot be replaced: only a new key
+      # gets rebuilt libraries stored. The price is a full rebuild with every new image. Restoring
+      # the newest entry and saving under a key of the libraries in use would avoid that, but the
+      # folder would then have to be pruned.
+      - name: Prepare build environment
+        id: prepare
+        run: |
+          New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
+          "image=$env:ImageOS-$env:ImageVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ steps.prepare.outputs.image }}-${{ hashFiles('vcpkg.json') }}
+
+      # Ninja needs the compiler's environment, which the developer shell of Visual Studio sets up
+      # for the rest of a step. Then the command of the README. PowerShell takes -Dname=value apart
+      # when it is written as one word, so -D stays a word of its own.
+      - name: Generate build system
+        run: |
+          & "$(vswhere -latest -property installationPath)\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation -NoLogo
+          cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release `
+              -D CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake `
+              -D VCPKG_TARGET_TRIPLET=x64-windows-static-md `
+              -D VCPKG_INSTALL_OPTIONS=--no-print-usage `
+              -D CMAKE_INSTALL_PREFIX=.
+
+      # Right after the step that fills it, so that it is kept even if a later step fails.
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        run: |
+          & "$(vswhere -latest -property installationPath)\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation -NoLogo
+          cmake --build build --target install
+
+      # The report is also handed on to the last job, for the notes of a release. An output of
+      # several lines is written between a line that names it and a line that ends it.
+      - name: Show version
+        id: version
+        run: |
+          $about = .\bin\instext --version --verbose
+          $about
+          'about<<EOF' >> $env:GITHUB_OUTPUT
+          $about >> $env:GITHUB_OUTPUT
+          'EOF' >> $env:GITHUB_OUTPUT
+
+      - name: Restore test samples
+        uses: actions/cache@v6
+        with:
+          path: tests/samples
+          key: samples-${{ runner.os }}-${{ hashFiles('tests/samples.cmake') }}
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # Kept for two weeks: the release job takes it within the same run, and the scheduled runs
+      # are at most eleven days apart, so there is always a recent build to download.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: instext-windows-x64
+          path: bin
+          if-no-files-found: error
+          retention-days: 14
+
+  # Build, test and run different analyzers on Linux.
+  # Running static code analysis, linters and sanitizers. Building in debug configuration,
+  # and the binaries are not kept - only the Windows release build is released.
+  linux:
+    name: Linux Analysis
+    if: github.event_name != 'workflow_dispatch' || inputs.linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+    steps:
+      - uses: actions/checkout@v7
+
+      # Cppcheck goes first: it needs nothing built, and what it finds ends the job early.
+      - name: Install Cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends cppcheck
+
+      # The two definitions stand for the ones that CMake hands to the compiler; their values do not
+      # matter here. With several threads Cppcheck needs a folder of its own to look across files,
+      # and that folder has to exist. The template makes an annotation of every finding, at its line
+      # in the source: "error" and "warning", Cppcheck's words for the two kinds of finding asked
+      # for, are GitHub's as well.
+      - name: Run Cppcheck
+        run: |
+          mkdir -p build/cppcheck
+          cppcheck --force --enable=warning --std=c++20 --library=boost --library=zlib \
+              '-DINSTEXT_VERSION="1.2.3"' '-DINSTEXT_BIT7Z_VERSION="1.2.3"' \
+              --check-level=exhaustive --error-exitcode=1 \
+              --cppcheck-build-dir=build/cppcheck -j "$(nproc)" \
+              --template='::{severity} file={file},line={line},title=Cppcheck {id}::{message}' \
+              src tests
+
+      - name: Prepare build environment
+        id: prepare
+        run: |
+          mkdir -p .vcpkg-cache
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ steps.prepare.outputs.image }}-${{ hashFiles('vcpkg.json') }}
+
+      # A debug build of InstExt with the address and undefined behaviour sanitizers. The libraries
+      # are built without them, and only as release builds, which halves that work. The last option
+      # makes CMake write down how each source is compiled, which Clang-Tidy needs to know.
+      - name: Generate build system
+        run: >
+          cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Debug
+          -D "CMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+          -D CMAKE_TOOLCHAIN_FILE=$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+          -D VCPKG_TARGET_TRIPLET=x64-linux-release
+          -D VCPKG_HOST_TRIPLET=x64-linux-release
+          -D VCPKG_INSTALL_OPTIONS=--no-print-usage
+          -D CMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Show version
+        run: build/instext --version --verbose
+
+      - name: Restore test samples
+        uses: actions/cache@v6
+        with:
+          path: tests/samples
+          key: samples-${{ runner.os }}-${{ hashFiles('tests/samples.cmake') }}
+
+      # A test passes when its output holds the expected text, whatever status the program returns,
+      # so a sanitizer's report alone would not fail it. With these options the sanitizer aborts the
+      # program instead, and that fails a test in any case.
+      - name: Test
+        env:
+          ASAN_OPTIONS: abort_on_error=1
+          UBSAN_OPTIONS: abort_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+      # With its default checks: Clang's own warnings and its static analyzer. Every finding counts
+      # as an error, which fails the step. The lines that report a finding are rewritten into the
+      # form that GitHub shows as an annotation at that line of the source.
+      - name: Run Clang-Tidy
+        run: |
+          finding='([^:]+):([0-9]+):[0-9]+: (warning|error): (.*) \[([^],]+)[^]]*\]'
+          run-clang-tidy -p build -quiet -warnings-as-errors='*' 2>&1 |
+              sed -E "s~^$PWD/$finding\$~::\3 file=\1,line=\2,title=Clang-Tidy \5::\4~"
+
+  # Build and run CodeQL, GitHub's own analyzer.
+  # Using its CodeQL CLI with explicit build command, just to keep the job clean and simple.
+  # The build process is very similar to that of the linux job, except here we do not enable
+  # sanitizers or generate compile commands (for Clang-Tidy), and we build release, the
+  # configuration that ships.
+  # It runs on the schedule and when a run started by hand asks for it, and in either case only
+  # in a public repository, since neither the tool's licence nor GitHub's code scanning covers a
+  # private one.
+  codeql:
+    name: CodeQL
+    if: (github.event_name == 'schedule' || inputs.codeql) && github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner has the tool in its tool cache, but not on its path. The last line puts it there
+      # for the steps below.
+      - name: Prepare build environment
+        id: prepare
+        run: |
+          mkdir -p .vcpkg-cache
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+          echo "$RUNNER_TOOL_CACHE"/CodeQL/*/x64/codeql >> "$GITHUB_PATH"
+
+      - name: Show CodeQL version
+        run: codeql version
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ steps.prepare.outputs.image }}-${{ hashFiles('vcpkg.json') }}
+
+      # A plain build is enough here: the tool only has to see the sources being compiled.
+      - name: Generate build system
+        run: >
+          cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release
+          -D CMAKE_TOOLCHAIN_FILE=$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+          -D VCPKG_TARGET_TRIPLET=x64-linux-release
+          -D VCPKG_HOST_TRIPLET=x64-linux-release
+          -D VCPKG_INSTALL_OPTIONS=--no-print-usage
+
+      # The key is the one of the Linux job, which builds the same libraries. Whichever of the two
+      # jobs comes first saves them, and the other one's save is then declined without an error.
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      # The tool runs the build itself and watches the compiler while it does, which is how it gets
+      # to know the sources. The watching ends with the command: none of it reaches later steps.
+      - name: Build
+        run: >
+          codeql database create "$RUNNER_TEMP/codeql" --language=cpp --threads=0
+          --command='cmake --build build'
+
+      # No queries are named, so the tool runs its default ones for the language.
+      - name: Analyze
+        run: >
+          codeql database analyze "$RUNNER_TEMP/codeql" --threads=0
+          --format=sarif-latest --sarif-category=cpp --output="$RUNNER_TEMP/codeql.sarif"
+
+      # The findings go to the repository's code scanning list. Only this step is handed the job's
+      # token, which the permissions above allow to write there and nowhere else.
+      - name: Upload results
+        env:
+          TOKEN: ${{ github.token }}
+        run: >
+          echo "$TOKEN" | codeql github upload-results --github-auth-stdin
+          --sarif="$RUNNER_TEMP/codeql.sarif"
+          --repository="$GITHUB_REPOSITORY" --ref="$GITHUB_REF" --commit="$GITHUB_SHA"
+
+  # Drafts a release, and only when both jobs above passed: for a pushed tag that starts with "v",
+  # and when a run started by hand asks for it. Such a run is started from main and needs no tag:
+  # the release is named after the version that the program reports, v0.1.0 for "InstExt 0.1.0",
+  # and GitHub makes the tag when the draft is published. A tag has to have that name.
+  # The draft holds a zip of what the Windows job built and a file with the SHA-256 checksum of
+  # that zip. Its notes list the commits since the tag before, or all of them the first time, and
+  # then give the report of "instext --version --verbose".
+  # In the report the engine's file keeps its name only: the folder it was in is the runner's.
+  release:
+    name: Draft Release
+    if: inputs.release || (github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      ABOUT: ${{ needs.windows.outputs.about }}
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # With the whole history and all tags, for the list of commits in the notes.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: instext-windows-x64
+          path: bin
+
+      - name: Create draft release
+        run: |
+          about=$(tr -d '\r' <<< "$ABOUT" | sed -E 's|^  .*[\\/]|  |')
+          built=$(head -n 1 <<< "$about")
+          if [[ ! $built =~ ^InstExt\ [0-9]+(\.[0-9]+)*$ ]]; then
+              echo "::error::The Windows job reported no version: $built"
+              exit 1
+          fi
+          tag=v${built#InstExt }
+          # From a tag, the tag has to be the one for the version that was built. From main there is
+          # no tag yet, and must not be: the draft is made for this commit.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+                  echo "::error::The tag $GITHUB_REF_NAME is not for the version that was built: $built"
+                  exit 1
+              fi
+              target=(--verify-tag)
+          elif [ "$GITHUB_REF" = refs/heads/main ]; then
+              if git rev-parse --quiet --verify "refs/tags/$tag" > /dev/null; then
+                  echo "::error::The tag $tag exists already: set a new version in CMakeLists.txt first"
+                  exit 1
+              fi
+              target=(--target "$GITHUB_SHA")
+          else
+              echo "::error::A release is made from main or from a version tag, not from $GITHUB_REF_NAME"
+              exit 1
+          fi
+          # A draft made from main gets its tag when it is published, and that tag starts a run of
+          # its own, which finds the release there and is done. A run started by hand was asked for
+          # a draft: it fails, so that an older draft is not taken for a new one.
+          if gh release view "$tag" > /dev/null 2>&1; then
+              if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+                  echo "::error::There is a release for $tag already: delete it first to have a new one drafted"
+                  exit 1
+              fi
+              echo "::notice::There is a release for $tag already, so none is drafted"
+              exit 0
+          fi
+          zip=instext-$tag-windows-x64.zip
+          (cd bin && zip -r "../$zip" .)
+          sha256sum "$zip" > "$zip.sha256"
+          previous=$(git describe --tags --abbrev=0 --match 'v*' --exclude "$tag" "$GITHUB_SHA" 2> /dev/null || true)
+          {
+              printf '%s\n' "Commits${previous:+ since $previous}:" ''
+              git log --no-merges --format='- %s (%h)' ${previous:+"$previous.."}"$GITHUB_SHA"
+              printf '%s\n' '' 'Output of `instext --version --verbose`:' '' '```text' "$about" '```'
+          } > notes.md
+          gh release create "$tag" "$zip" "$zip.sha256" --draft "${target[@]}" \
+              --title "$tag" --notes-file notes.md
